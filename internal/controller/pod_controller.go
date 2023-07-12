@@ -18,12 +18,15 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/go-logr/logr"
 	"github.com/pingcap/errors"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -48,7 +51,7 @@ type PodReconciler struct {
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.15.0/pkg/reconcile
 func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("pod", req.NamespacedName)
-	fmt.Printf("\nEssential container exited, deleting the pod %s in namespace %s\n", req.Name, req.Namespace)
+	fmt.Printf("\nEssential container exited, injecting process kill container in the pod %s in namespace %s\n", req.Name, req.Namespace)
 
 	pod := &corev1.Pod{}
 	if err := r.Get(ctx, req.NamespacedName, pod); err != nil {
@@ -60,14 +63,16 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, err
 	}
 
-	// Delete the pod
+	// Terminate the pid 1 in pod
 	// @todo add the pod deletion as events in namespace. Useful for debugging.
-	if err := r.Delete(ctx, pod); err != nil {
-		log.Error(err, "Failed to delete Pod")
+	err := r.injectEphemeralContainer(ctx, pod, &log)
+
+	if err != nil {
+		log.Error(err, "Failed to inject ephemeral container into pod")
 		return ctrl.Result{}, err
 	}
 
-	log.Info("Pod deleted successfully")
+	log.Info("Pod killed successfully")
 	return ctrl.Result{}, nil
 }
 
@@ -141,4 +146,54 @@ func getStateReason(state corev1.ContainerState) string {
 	} else {
 		return ""
 	}
+}
+
+// injectEphemeralContainer injects an ephemeral container into the running Pod and sets the entry point as "kill 1".
+func (r *PodReconciler) injectEphemeralContainer(ctx context.Context, pod *corev1.Pod, log *logr.Logger) error {
+	ec := &corev1.EphemeralContainer{
+		EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+			Name:      "essential-container-sidecar",
+			Image:     "busybox",
+			Command:   []string{"/bin/sh"},
+			Args:      []string{"-c", "kill -INT 1"},
+			TTY:       false,
+			Stdin:     false,
+			Resources: corev1.ResourceRequirements{},
+			SecurityContext: &corev1.SecurityContext{
+				Capabilities: &corev1.Capabilities{
+					Add: []corev1.Capability{
+						"SYS_PTRACE",
+					},
+				},
+			},
+		},
+	}
+
+	podJS, _ := json.Marshal(pod)
+	copied := pod.DeepCopy()
+	copied.Spec.EphemeralContainers = append(copied.Spec.EphemeralContainers, *ec)
+
+	debugJS, err := json.Marshal(copied)
+	if err != nil {
+		return fmt.Errorf("error creating JSON for debug container: %v", err)
+	}
+
+	patch, err := strategicpatch.CreateTwoWayMergePatch(podJS, debugJS, pod)
+	if err != nil {
+		return fmt.Errorf("error creating patch to add debug container: %v", err)
+	}
+
+	// fmt.Printf("generated strategic merge patch for debug container: %s \n", patch)
+
+	src := r.SubResource("ephemeralcontainers")
+	err = src.Patch(ctx, pod, client.RawPatch(types.StrategicMergePatchType, patch))
+	if err != nil {
+		if errors.IsNotFound(err) {
+			return fmt.Errorf("pod not found: %s/%s", pod.Namespace, pod.Name)
+		}
+		return err
+	}
+
+	log.Info("Ephemeral container injected successfully")
+	return nil
 }
